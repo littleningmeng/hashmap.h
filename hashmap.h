@@ -40,6 +40,7 @@
 #endif
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
 
 #if (defined(_MSC_VER) && defined(__AVX__)) ||                                 \
     (!defined(_MSC_VER) && defined(__SSE4_2__))
@@ -75,10 +76,14 @@
 #define HASHMAP_USED
 #endif
 
+#define STRING_KEY  0
+#define INTEGER_KEY 1
+
 /* We need to keep keys and values. */
 struct hashmap_element_s {
   const char *key;
   unsigned key_len;
+  unsigned long long ull_key;
   int in_use;
   void *data;
 };
@@ -88,6 +93,7 @@ struct hashmap_element_s {
 struct hashmap_s {
   unsigned table_size;
   unsigned size;
+  unsigned key_type; // 0 string 1 integer
   struct hashmap_element_s *data;
 };
 
@@ -104,7 +110,7 @@ extern "C" {
 ///
 /// Note that the initial size of the hashmap must be a power of two, and
 /// creation of the hashmap will fail if this is not the case.
-static int hashmap_create(const unsigned initial_size,
+static int hashmap_create(const unsigned initial_size, const unsigned key_type,
                           struct hashmap_s *const out_hashmap) HASHMAP_USED;
 
 /// @brief Put an element into the hashmap.
@@ -118,7 +124,7 @@ static int hashmap_create(const unsigned initial_size,
 /// must remain a valid pointer until the hashmap entry is removed or the
 /// hashmap is destroyed.
 static int hashmap_put(struct hashmap_s *const hashmap, const char *const key,
-                       const unsigned len, void *const value) HASHMAP_USED;
+                       const unsigned len, const unsigned long long ull_key, void *const value) HASHMAP_USED;
 
 /// @brief Get an element from the hashmap.
 /// @param hashmap The hashmap to get from.
@@ -127,7 +133,8 @@ static int hashmap_put(struct hashmap_s *const hashmap, const char *const key,
 /// @return The previously set element, or NULL if none exists.
 static void *hashmap_get(const struct hashmap_s *const hashmap,
                          const char *const key,
-                         const unsigned len) HASHMAP_USED;
+                         const unsigned len,
+                         const unsigned long long ull_key) HASHMAP_USED;
 
 /// @brief Remove an element from the hashmap.
 /// @param hashmap The hashmap to remove from.
@@ -136,18 +143,9 @@ static void *hashmap_get(const struct hashmap_s *const hashmap,
 /// @return On success 0 is returned.
 static int hashmap_remove(struct hashmap_s *const hashmap,
                           const char *const key,
-                          const unsigned len) HASHMAP_USED;
+                          const unsigned len,
+                          const unsigned long long ull_key) HASHMAP_USED;
 
-/// @brief Remove an element from the hashmap.
-/// @param hashmap The hashmap to remove from.
-/// @param key The string key to use.
-/// @param len The length of the string key.
-/// @return On success the original stored key pointer is returned, on failure
-/// NULL is returned.
-static const char *
-hashmap_remove_and_return_key(struct hashmap_s *const hashmap,
-                              const char *const key,
-                              const unsigned len) HASHMAP_USED;
 
 /// @brief Iterate over all the elements in a hashmap.
 /// @param hashmap The hashmap to iterate over.
@@ -186,12 +184,14 @@ static unsigned hashmap_crc32_helper(const char *const s,
                                      const unsigned len) HASHMAP_USED;
 static unsigned hashmap_hash_helper_int_helper(const struct hashmap_s *const m,
                                                const char *const keystring,
-                                               const unsigned len) HASHMAP_USED;
-static int hashmap_match_helper(const struct hashmap_element_s *const element,
+                                               const unsigned len,
+                                               const unsigned long long ull_key) HASHMAP_USED;
+static int hashmap_match_helper(const struct hashmap_s *const m, const struct hashmap_element_s *const element,
                                 const char *const key,
-                                const unsigned len) HASHMAP_USED;
+                                const unsigned len,
+                                const unsigned long long ull_key) HASHMAP_USED;
 static int hashmap_hash_helper(const struct hashmap_s *const m,
-                               const char *const key, const unsigned len,
+                               const char *const key, const unsigned len, const unsigned long long ull_key,
                                unsigned *const out_index) HASHMAP_USED;
 static int
 hashmap_rehash_iterator(void *const new_hash,
@@ -212,12 +212,16 @@ static int hashmap_rehash_helper(struct hashmap_s *const m) HASHMAP_USED;
 #define HASHMAP_NULL 0
 #endif
 
-int hashmap_create(const unsigned initial_size,
+int hashmap_create(const unsigned initial_size, const unsigned key_type,
                    struct hashmap_s *const out_hashmap) {
   out_hashmap->table_size = initial_size;
   out_hashmap->size = 0;
+  out_hashmap->key_type = key_type;
 
   if (0 == initial_size || 0 != (initial_size & (initial_size - 1))) {
+    return 1;
+  }
+  if(key_type != STRING_KEY && key_type != INTEGER_KEY) {
     return 1;
   }
 
@@ -232,11 +236,11 @@ int hashmap_create(const unsigned initial_size,
 }
 
 int hashmap_put(struct hashmap_s *const m, const char *const key,
-                const unsigned len, void *const value) {
+                const unsigned len, const unsigned long long ull_key, void *const value) {
   unsigned int index;
 
   /* Find a place to put our value. */
-  while (!hashmap_hash_helper(m, key, len, &index)) {
+  while (!hashmap_hash_helper(m, key, len, ull_key, &index)) {
     if (hashmap_rehash_helper(m)) {
       return 1;
     }
@@ -245,6 +249,7 @@ int hashmap_put(struct hashmap_s *const m, const char *const key,
   /* Set the data. */
   m->data[index].data = value;
   m->data[index].key = key;
+  m->data[index].ull_key = ull_key;
   m->data[index].key_len = len;
 
   /* If the hashmap element was not already in use, set that it is being used
@@ -258,17 +263,17 @@ int hashmap_put(struct hashmap_s *const m, const char *const key,
 }
 
 void *hashmap_get(const struct hashmap_s *const m, const char *const key,
-                  const unsigned len) {
+                  const unsigned len, const unsigned long long ull_key) {
   unsigned int curr;
   unsigned int i;
 
   /* Find data location */
-  curr = hashmap_hash_helper_int_helper(m, key, len);
+  curr = hashmap_hash_helper_int_helper(m, key, len, ull_key);
 
   /* Linear probing, if necessary */
   for (i = 0; i < HASHMAP_MAX_CHAIN_LENGTH; i++) {
     if (m->data[curr].in_use) {
-      if (hashmap_match_helper(&m->data[curr], key, len)) {
+      if (hashmap_match_helper(m, &m->data[curr], key, len, ull_key)) {
         return m->data[curr].data;
       }
     }
@@ -281,17 +286,17 @@ void *hashmap_get(const struct hashmap_s *const m, const char *const key,
 }
 
 int hashmap_remove(struct hashmap_s *const m, const char *const key,
-                   const unsigned len) {
+                   const unsigned len, const unsigned long long ull_key) {
   unsigned int i;
   unsigned int curr;
 
   /* Find key */
-  curr = hashmap_hash_helper_int_helper(m, key, len);
+  curr = hashmap_hash_helper_int_helper(m, key, len, ull_key);
 
   /* Linear probing, if necessary */
   for (i = 0; i < HASHMAP_MAX_CHAIN_LENGTH; i++) {
     if (m->data[curr].in_use) {
-      if (hashmap_match_helper(&m->data[curr], key, len)) {
+      if (hashmap_match_helper(m, &m->data[curr], key, len, ull_key)) {
         /* Blank out the fields including in_use */
         memset(&m->data[curr], 0, sizeof(struct hashmap_element_s));
 
@@ -308,37 +313,6 @@ int hashmap_remove(struct hashmap_s *const m, const char *const key,
   return 1;
 }
 
-const char *hashmap_remove_and_return_key(struct hashmap_s *const m,
-                                          const char *const key,
-                                          const unsigned len) {
-  unsigned int i;
-  unsigned int curr;
-
-  /* Find key */
-  curr = hashmap_hash_helper_int_helper(m, key, len);
-
-  /* Linear probing, if necessary */
-  for (i = 0; i < HASHMAP_MAX_CHAIN_LENGTH; i++) {
-    if (m->data[curr].in_use) {
-      if (hashmap_match_helper(&m->data[curr], key, len)) {
-        const char *const stored_key = m->data[curr].key;
-
-        /* Blank out the fields */
-        m->data[curr].in_use = 0;
-        m->data[curr].data = HASHMAP_NULL;
-        m->data[curr].key = HASHMAP_NULL;
-
-        /* Reduce the size */
-        m->size--;
-
-        return stored_key;
-      }
-    }
-    curr = (curr + 1) % m->table_size;
-  }
-
-  return HASHMAP_NULL;
-}
 
 int hashmap_iterate(const struct hashmap_s *const m,
                     int (*f)(void *const, void *const), void *const context) {
@@ -469,8 +443,15 @@ unsigned hashmap_crc32_helper(const char *const s, const unsigned len) {
 
 unsigned hashmap_hash_helper_int_helper(const struct hashmap_s *const m,
                                         const char *const keystring,
-                                        const unsigned len) {
-  unsigned key = hashmap_crc32_helper(keystring, len);
+                                        const unsigned len, const unsigned long long ull_key) {
+  unsigned long long key = 0;
+  unsigned int index = 0;
+  if(m->key_type == INTEGER_KEY) {
+    key = ull_key;
+    goto end;
+  }
+  
+  key = hashmap_crc32_helper(keystring, len);
 
   /* Robert Jenkins' 32 bit Mix Function */
   key += (key << 12);
@@ -484,17 +465,19 @@ unsigned hashmap_hash_helper_int_helper(const struct hashmap_s *const m,
 
   /* Knuth's Multiplicative Method */
   key = (key >> 3) * 2654435761;
-
-  return key % m->table_size;
+end:
+  index = key % m->table_size;
+  // printf("key is %u, index is %u\n", key, index);
+  return index;
 }
 
-int hashmap_match_helper(const struct hashmap_element_s *const element,
-                         const char *const key, const unsigned len) {
-  return (element->key_len == len) && (0 == memcmp(element->key, key, len));
+int hashmap_match_helper(const struct hashmap_s *const m, const struct hashmap_element_s *const element,
+                         const char *const key, const unsigned len, const unsigned long long ull_key) {
+  return m->key_type == STRING_KEY ? (element->key_len == len) && (0 == memcmp(element->key, key, len)) : element->ull_key == ull_key;
 }
 
 int hashmap_hash_helper(const struct hashmap_s *const m, const char *const key,
-                        const unsigned len, unsigned *const out_index) {
+                        const unsigned len, const unsigned long long ull_key, unsigned *const out_index) {
   unsigned int start, curr;
   unsigned int i;
   int total_in_use;
@@ -505,7 +488,7 @@ int hashmap_hash_helper(const struct hashmap_s *const m, const char *const key,
   }
 
   /* Find the best index */
-  curr = start = hashmap_hash_helper_int_helper(m, key, len);
+  curr = start = hashmap_hash_helper_int_helper(m, key, len, ull_key);
 
   /* First linear probe to check if we've already insert the element */
   total_in_use = 0;
@@ -515,7 +498,7 @@ int hashmap_hash_helper(const struct hashmap_s *const m, const char *const key,
 
     total_in_use += in_use;
 
-    if (in_use && hashmap_match_helper(&m->data[curr], key, len)) {
+    if (in_use && hashmap_match_helper(m, &m->data[curr], key, len, ull_key)) {
       *out_index = curr;
       return 1;
     }
@@ -544,7 +527,7 @@ int hashmap_hash_helper(const struct hashmap_s *const m, const char *const key,
 int hashmap_rehash_iterator(void *const new_hash,
                             struct hashmap_element_s *const e) {
   int temp = hashmap_put(HASHMAP_PTR_CAST(struct hashmap_s *, new_hash), e->key,
-                         e->key_len, e->data);
+                         e->key_len, e->ull_key, e->data);
   if (0 < temp) {
     return 1;
   }
@@ -560,7 +543,7 @@ int hashmap_rehash_helper(struct hashmap_s *const m) {
 
   struct hashmap_s new_hash;
 
-  int flag = hashmap_create(new_size, &new_hash);
+  int flag = hashmap_create(new_size, m->key_type, &new_hash);
 
   if (0 != flag) {
     return flag;
